@@ -1,4 +1,4 @@
-# sql_join_optimizer.py
+# sql_graph_optimizer.py
 import psycopg2
 import time
 import math
@@ -223,3 +223,6 @@ def dijkstra(graph, start, end):
             if neighbor not in visited:
                 heapq.heappush(queue, (cost+weight, neighbor, path))
     return float('inf'), []
+
+    
+# powereb and created by Giuseppe D'Ambrosio

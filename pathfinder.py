@@ -26,6 +26,7 @@ def create_db_schema_table(conn):
         cur.execute(sql)
     conn.commit()
 
+
 def populate_db_schema(conn):
     """Populate db_schema from information_schema."""
     columns_sql = """
@@ -77,6 +78,7 @@ def populate_db_schema(conn):
             """, (schema, table, column, dtype, is_pk, is_fk, ref_table, ref_col))
     conn.commit()
 
+
 # ----------------------------
 # Join Metrics
 # ----------------------------
@@ -103,6 +105,7 @@ def create_join_metrics_table(conn):
         cur.execute(sql)
     conn.commit()
 
+
 def populate_join_metrics_real(conn):
     """Populate join_metrics with real join metrics."""
     with conn.cursor() as cur:
@@ -119,13 +122,21 @@ def populate_join_metrics_real(conn):
                 FROM db_schema
                 WHERE table_name=%s AND column_name=%s
             """, (right_table, right_col))
-            right_is_pk, right_is_fk = cur.fetchone()
+            result = cur.fetchone()
+            if not result:
+                continue
+            right_is_pk, right_is_fk = result
 
             join_sql = f"SELECT COUNT(*) FROM {left_table} l JOIN {right_table} r ON l.{left_col} = r.{right_col}"
             start_time = time.time()
-            cur.execute(join_sql)
-            row_count = cur.fetchone()[0]
-            elapsed_ms = (time.time() - start_time) * 1000
+            try:
+                cur.execute(join_sql)
+                row_count = cur.fetchone()[0]
+                elapsed_ms = (time.time() - start_time) * 1000
+            except Exception as e:
+                conn.rollback()
+                print(f"[WARN] Join failed for {left_table}-{right_table}: {e}")
+                continue
 
             cur.execute("""
                 INSERT INTO join_metrics (
@@ -149,6 +160,7 @@ def populate_join_metrics_real(conn):
             ))
     conn.commit()
 
+
 # ----------------------------
 # Join Weights
 # ----------------------------
@@ -168,6 +180,7 @@ def create_join_weights_table(conn):
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
+
 
 def update_join_weights(conn, alpha=0.6, beta=0.3, gamma=0.1):
     """Calculate weights based on real join metrics."""
@@ -191,6 +204,7 @@ def update_join_weights(conn, alpha=0.6, beta=0.3, gamma=0.1):
             """, (left_table, left_col, right_table, right_col, weight))
     conn.commit()
 
+
 # ----------------------------
 # Dijkstra Shortest Path
 # ----------------------------
@@ -203,6 +217,7 @@ def build_graph(conn):
             graph.setdefault(left, {})[right] = weight
             graph.setdefault(right, {})[left] = weight
     return graph
+
 
 def dijkstra(graph, start, end):
     """Find shortest path from start to end in weighted graph."""
@@ -221,8 +236,64 @@ def dijkstra(graph, start, end):
 
         for neighbor, weight in graph.get(node, {}).items():
             if neighbor not in visited:
-                heapq.heappush(queue, (cost+weight, neighbor, path))
+                heapq.heappush(queue, (cost + weight, neighbor, path))
     return float('inf'), []
 
-    
-# powereb and created by Giuseppe D'Ambrosio
+
+# ----------------------------
+# Query Builder (Post-Dijkstra)
+# ----------------------------
+def build_optimized_query(conn, start_table, end_table, select_columns=None):
+    """
+    Build an optimized SQL query based on the minimum join path.
+    Uses db_schema relationships and weights computed via Dijkstra.
+    """
+    # 1. Build graph and find optimal path
+    graph = build_graph(conn)
+    cost, path = dijkstra(graph, start_table, end_table)
+
+    if not path or cost == float('inf'):
+        raise ValueError(f"No path found between {start_table} and {end_table}")
+
+    # 2. Retrieve join relationships between adjacent tables
+    join_conditions = []
+    with conn.cursor() as cur:
+        for i in range(len(path) - 1):
+            left, right = path[i], path[i + 1]
+            cur.execute("""
+                SELECT column_name, references_table, references_column
+                FROM db_schema
+                WHERE (table_name = %s AND references_table = %s)
+                   OR (table_name = %s AND references_table = %s)
+            """, (left, right, right, left))
+            rel = cur.fetchone()
+            if not rel:
+                raise ValueError(f"No join condition found between {left} and {right}")
+            col, ref_table, ref_col = rel
+            if ref_table == right:
+                join_conditions.append(f"{left}.{col} = {right}.{ref_col}")
+            else:
+                join_conditions.append(f"{right}.{col} = {left}.{ref_col}")
+
+    # 3. Construct final SQL query
+    select_clause = "*"
+    if select_columns:
+        select_clause = ", ".join(select_columns)
+
+    from_clause = path[0]
+    for i in range(1, len(path)):
+        from_clause += f"\nJOIN {path[i]} ON {join_conditions[i - 1]}"
+
+    query = f"SELECT {select_clause}\nFROM {from_clause};"
+
+    return {
+        "cost": cost,
+        "path": path,
+        "sql": query
+    }
+
+
+# ----------------------------
+# Author
+# ----------------------------
+# powered and created by Giuseppe D'Ambrosio
